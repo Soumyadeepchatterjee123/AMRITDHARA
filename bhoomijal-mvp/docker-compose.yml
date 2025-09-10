@@ -1,0 +1,366 @@
+version: '3.8'
+
+# Bhoomijal MVP - Groundwater Monitoring Platform
+# Complete stack with development and production profiles
+
+services:
+  # Frontend - React application
+  frontend:
+    profiles: ["dev", "prod"]
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      target: ${FRONTEND_TARGET:-development}
+      args:
+        - VITE_API_URL=${API_URL:-http://localhost:8000}
+        - VITE_MAPBOX_TOKEN=${MAPBOX_TOKEN:-}
+    image: bhoomijal/frontend:${TAG:-latest}
+    container_name: bhoomijal-frontend
+    ports:
+      - "${FRONTEND_PORT:-3000}:${FRONTEND_CONTAINER_PORT:-3000}"
+    volumes:
+      - ./frontend:/app:delegated
+      - /app/node_modules
+    environment:
+      - NODE_ENV=${NODE_ENV:-development}
+      - CHOKIDAR_USEPOLLING=true
+      - VITE_API_URL=${API_URL:-http://localhost:8000}
+    depends_on:
+      - backend
+    networks:
+      - bhoomijal-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:${FRONTEND_CONTAINER_PORT:-3000}/health.txt"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Backend - FastAPI application
+  backend:
+    profiles: ["dev", "prod"]
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: ${BACKEND_TARGET:-development}
+    image: bhoomijal/backend:${TAG:-latest}
+    container_name: bhoomijal-backend
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    volumes:
+      - ./backend:/app:delegated
+      - backend_media:/app/media
+    environment:
+      - ENVIRONMENT=${ENVIRONMENT:-development}
+      - DEBUG=${DEBUG:-True}
+      - SECRET_KEY=${SECRET_KEY:-insecure_dev_key_change_in_production}
+      - ALLOWED_HOSTS=${ALLOWED_HOSTS:-localhost 127.0.0.1}
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000}
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-bhoomijal}:${POSTGRES_PASSWORD:-bhoomijal}@postgres:5432/${POSTGRES_DB:-bhoomijal}
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-bhoomijal}@redis:6379/0
+      - CELERY_BROKER_URL=redis://:${REDIS_PASSWORD:-bhoomijal}@redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://:${REDIS_PASSWORD:-bhoomijal}@redis:6379/2
+      - PROMETHEUS_MULTIPROC_DIR=/tmp
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - bhoomijal-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # Celery worker for async tasks
+  celery:
+    profiles: ["dev", "prod"]
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: ${BACKEND_TARGET:-development}
+    image: bhoomijal/backend:${TAG:-latest}
+    container_name: bhoomijal-celery
+    command: celery -A app.core.celery worker --loglevel=${LOG_LEVEL:-info}
+    volumes:
+      - ./backend:/app:delegated
+    environment:
+      - ENVIRONMENT=${ENVIRONMENT:-development}
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-bhoomijal}:${POSTGRES_PASSWORD:-bhoomijal}@postgres:5432/${POSTGRES_DB:-bhoomijal}
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-bhoomijal}@redis:6379/0
+      - CELERY_BROKER_URL=redis://:${REDIS_PASSWORD:-bhoomijal}@redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://:${REDIS_PASSWORD:-bhoomijal}@redis:6379/2
+    depends_on:
+      - backend
+      - redis
+    networks:
+      - bhoomijal-network
+    restart: unless-stopped
+
+  # Celery beat for scheduled tasks
+  celery-beat:
+    profiles: ["dev", "prod"]
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: ${BACKEND_TARGET:-development}
+    image: bhoomijal/backend:${TAG:-latest}
+    container_name: bhoomijal-celery-beat
+    command: celery -A app.core.celery beat --loglevel=${LOG_LEVEL:-info}
+    volumes:
+      - ./backend:/app:delegated
+    environment:
+      - ENVIRONMENT=${ENVIRONMENT:-development}
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-bhoomijal}:${POSTGRES_PASSWORD:-bhoomijal}@postgres:5432/${POSTGRES_DB:-bhoomijal}
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-bhoomijal}@redis:6379/0
+      - CELERY_BROKER_URL=redis://:${REDIS_PASSWORD:-bhoomijal}@redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://:${REDIS_PASSWORD:-bhoomijal}@redis:6379/2
+    depends_on:
+      - celery
+    networks:
+      - bhoomijal-network
+    restart: unless-stopped
+
+  # PostgreSQL with PostGIS extension
+  postgres:
+    profiles: ["dev", "prod"]
+    image: postgis/postgis:14-3.3
+    container_name: bhoomijal-postgres
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/init-scripts:/docker-entrypoint-initdb.d
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-bhoomijal}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-bhoomijal}
+      - POSTGRES_DB=${POSTGRES_DB:-bhoomijal}
+    networks:
+      - bhoomijal-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-bhoomijal} -d ${POSTGRES_DB:-bhoomijal}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # Redis for caching and message broker
+  redis:
+    profiles: ["dev", "prod"]
+    image: redis:7-alpine
+    container_name: bhoomijal-redis
+    command: redis-server --requirepass ${REDIS_PASSWORD:-bhoomijal} --appendonly yes
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - bhoomijal-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-bhoomijal}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # Prometheus for metrics collection
+  prometheus:
+    profiles: ["dev", "prod"]
+    image: prom/prometheus:v2.46.0
+    container_name: bhoomijal-prometheus
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./monitoring/prometheus/rules:/etc/prometheus/rules
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    networks:
+      - bhoomijal-network
+    restart: unless-stopped
+    depends_on:
+      - backend
+
+  # Grafana for visualization
+  grafana:
+    profiles: ["dev", "prod"]
+    image: grafana/grafana:10.1.4
+    container_name: bhoomijal-grafana
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards
+      - grafana_data:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_DOMAIN=${DOMAIN:-localhost}
+      - GF_SMTP_ENABLED=${GRAFANA_SMTP_ENABLED:-false}
+      - GF_SMTP_HOST=${GRAFANA_SMTP_HOST:-smtp.example.com}
+      - GF_SMTP_USER=${GRAFANA_SMTP_USER:-user}
+      - GF_SMTP_PASSWORD=${GRAFANA_SMTP_PASSWORD:-password}
+    ports:
+      - "${GRAFANA_PORT:-3001}:3000"
+    networks:
+      - bhoomijal-network
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+
+  # Node exporter for host metrics
+  node-exporter:
+    profiles: ["dev", "prod"]
+    image: prom/node-exporter:v1.6.1
+    container_name: bhoomijal-node-exporter
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--path.rootfs=/rootfs'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    ports:
+      - "9100:9100"
+    networks:
+      - bhoomijal-network
+    restart: unless-stopped
+
+  # Postgres exporter for database metrics
+  postgres-exporter:
+    profiles: ["dev", "prod"]
+    image: prometheuscommunity/postgres-exporter:v0.13.2
+    container_name: bhoomijal-postgres-exporter
+    environment:
+      - DATA_SOURCE_NAME=postgresql://${POSTGRES_USER:-bhoomijal}:${POSTGRES_PASSWORD:-bhoomijal}@postgres:5432/${POSTGRES_DB:-bhoomijal}?sslmode=disable
+    ports:
+      - "9187:9187"
+    networks:
+      - bhoomijal-network
+    restart: unless-stopped
+    depends_on:
+      - postgres
+
+  # Redis exporter for Redis metrics
+  redis-exporter:
+    profiles: ["dev", "prod"]
+    image: oliver006/redis_exporter:v1.54.0
+    container_name: bhoomijal-redis-exporter
+    environment:
+      - REDIS_ADDR=redis://redis:6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-bhoomijal}
+    ports:
+      - "9121:9121"
+    networks:
+      - bhoomijal-network
+    restart: unless-stopped
+    depends_on:
+      - redis
+
+  # AlertManager for alert handling
+  alertmanager:
+    profiles: ["prod"]
+    image: prom/alertmanager:v0.26.0
+    container_name: bhoomijal-alertmanager
+    volumes:
+      - ./monitoring/alertmanager:/etc/alertmanager
+      - alertmanager_data:/alertmanager
+    command:
+      - '--config.file=/etc/alertmanager/alertmanager.yml'
+      - '--storage.path=/alertmanager'
+    ports:
+      - "${ALERTMANAGER_PORT:-9093}:9093"
+    networks:
+      - bhoomijal-network
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+
+  # Loki for log aggregation (production only)
+  loki:
+    profiles: ["prod"]
+    image: grafana/loki:2.9.1
+    container_name: bhoomijal-loki
+    volumes:
+      - ./monitoring/loki:/etc/loki
+      - loki_data:/loki
+    command: -config.file=/etc/loki/loki-config.yml
+    ports:
+      - "${LOKI_PORT:-3100}:3100"
+    networks:
+      - bhoomijal-network
+    restart: unless-stopped
+
+  # Promtail for log collection (production only)
+  promtail:
+    profiles: ["prod"]
+    image: grafana/promtail:2.9.1
+    container_name: bhoomijal-promtail
+    volumes:
+      - ./monitoring/promtail:/etc/promtail
+      - /var/log:/var/log
+      - /var/lib/docker/containers:/var/lib/docker/containers
+    command: -config.file=/etc/promtail/promtail-config.yml
+    networks:
+      - bhoomijal-network
+    restart: unless-stopped
+    depends_on:
+      - loki
+
+  # Development tools - only in dev profile
+  adminer:
+    profiles: ["dev"]
+    image: adminer:4.8.1
+    container_name: bhoomijal-adminer
+    environment:
+      - ADMINER_DEFAULT_SERVER=postgres
+      - ADMINER_DESIGN=pepa-linha
+    ports:
+      - "${ADMINER_PORT:-8080}:8080"
+    networks:
+      - bhoomijal-network
+    restart: unless-stopped
+    depends_on:
+      - postgres
+
+  # Redis Commander for Redis management (dev only)
+  redis-commander:
+    profiles: ["dev"]
+    image: rediscommander/redis-commander:latest
+    container_name: bhoomijal-redis-commander
+    environment:
+      - REDIS_HOSTS=local:redis:6379:0:${REDIS_PASSWORD:-bhoomijal}
+    ports:
+      - "${REDIS_COMMANDER_PORT:-8081}:8081"
+    networks:
+      - bhoomijal-network
+    restart: unless-stopped
+    depends_on:
+      - redis
+
+networks:
+  bhoomijal-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  backend_media:
+  prometheus_data:
+  grafana_data:
+  alertmanager_data:
+  loki_data:

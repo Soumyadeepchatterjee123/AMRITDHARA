@@ -1,0 +1,603 @@
+name: Bhoomijal MVP CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - production
+
+env:
+  REGISTRY: ghcr.io
+  FRONTEND_IMAGE_NAME: ${{ github.repository }}/frontend
+  BACKEND_IMAGE_NAME: ${{ github.repository }}/backend
+  TRIVY_SEVERITY: 'CRITICAL,HIGH'
+  CACHE_KEY_PREFIX: bhoomijal-mvp-v1
+
+jobs:
+  frontend-lint-test:
+    name: Frontend Lint & Test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./bhoomijal-mvp/frontend
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: './bhoomijal-mvp/frontend/package-lock.json'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Lint
+        run: npm run lint
+      
+      - name: Type check
+        run: npm run typecheck
+      
+      - name: Run unit tests
+        run: npm test -- --coverage
+      
+      - name: Upload test coverage
+        uses: actions/upload-artifact@v3
+        with:
+          name: frontend-coverage
+          path: ./bhoomijal-mvp/frontend/coverage
+      
+      - name: Run accessibility tests
+        run: npm run test:accessibility
+      
+      - name: Run Lighthouse CI
+        uses: treosh/lighthouse-ci-action@v9
+        with:
+          configPath: './bhoomijal-mvp/frontend/lighthouse.config.js'
+          uploadArtifacts: true
+          temporaryPublicStorage: true
+      
+      - name: Bundle analysis
+        run: npm run build -- --stats && npx webpack-bundle-analyzer dist/stats.json --port 8888 --report dist/report.html --mode static
+      
+      - name: Upload bundle analysis
+        uses: actions/upload-artifact@v3
+        with:
+          name: frontend-bundle-analysis
+          path: ./bhoomijal-mvp/frontend/dist/report.html
+
+  backend-lint-test:
+    name: Backend Lint & Test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./bhoomijal-mvp/backend
+    
+    services:
+      postgres:
+        image: postgis/postgis:14-3.3
+        env:
+          POSTGRES_USER: bhoomijal_test
+          POSTGRES_PASSWORD: bhoomijal_test
+          POSTGRES_DB: bhoomijal_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+          cache-dependency-path: './bhoomijal-mvp/backend/requirements*.txt'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+      
+      - name: Lint with flake8
+        run: flake8 app tests
+      
+      - name: Check formatting with black
+        run: black --check app tests
+      
+      - name: Type check with mypy
+        run: mypy app
+      
+      - name: Run unit tests
+        env:
+          DATABASE_URL: postgresql://bhoomijal_test:bhoomijal_test@localhost:5432/bhoomijal_test
+          REDIS_URL: redis://localhost:6379/0
+          ENVIRONMENT: test
+          SECRET_KEY: test_secret_key
+        run: |
+          pytest --cov=app --cov-report=xml --cov-report=term tests/unit
+      
+      - name: Run integration tests
+        env:
+          DATABASE_URL: postgresql://bhoomijal_test:bhoomijal_test@localhost:5432/bhoomijal_test
+          REDIS_URL: redis://localhost:6379/0
+          ENVIRONMENT: test
+          SECRET_KEY: test_secret_key
+        run: |
+          pytest tests/integration
+      
+      - name: Upload test coverage
+        uses: actions/upload-artifact@v3
+        with:
+          name: backend-coverage
+          path: ./bhoomijal-mvp/backend/coverage.xml
+
+  build-scan-frontend:
+    name: Build & Scan Frontend
+    needs: [frontend-lint-test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.FRONTEND_IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=sha,format=short
+      
+      - name: Build and export to Docker
+        uses: docker/build-push-action@v4
+        with:
+          context: ./bhoomijal-mvp/frontend
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ env.CACHE_KEY_PREFIX }}-frontend
+          cache-to: type=gha,mode=max,scope=${{ env.CACHE_KEY_PREFIX }}-frontend
+      
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.meta.outputs.tags }}
+          format: 'sarif'
+          output: 'trivy-frontend-results.sarif'
+          severity: ${{ env.TRIVY_SEVERITY }}
+      
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-frontend-results.sarif'
+          category: 'frontend-trivy'
+      
+      - name: Build and push
+        uses: docker/build-push-action@v4
+        with:
+          context: ./bhoomijal-mvp/frontend
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ env.CACHE_KEY_PREFIX }}-frontend
+          cache-to: type=gha,mode=max,scope=${{ env.CACHE_KEY_PREFIX }}-frontend
+
+  build-scan-backend:
+    name: Build & Scan Backend
+    needs: [backend-lint-test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=sha,format=short
+      
+      - name: Build and export to Docker
+        uses: docker/build-push-action@v4
+        with:
+          context: ./bhoomijal-mvp/backend
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ env.CACHE_KEY_PREFIX }}-backend
+          cache-to: type=gha,mode=max,scope=${{ env.CACHE_KEY_PREFIX }}-backend
+      
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.meta.outputs.tags }}
+          format: 'sarif'
+          output: 'trivy-backend-results.sarif'
+          severity: ${{ env.TRIVY_SEVERITY }}
+      
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-backend-results.sarif'
+          category: 'backend-trivy'
+      
+      - name: Build and push
+        uses: docker/build-push-action@v4
+        with:
+          context: ./bhoomijal-mvp/backend
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ env.CACHE_KEY_PREFIX }}-backend
+          cache-to: type=gha,mode=max,scope=${{ env.CACHE_KEY_PREFIX }}-backend
+
+  sonarcloud:
+    name: SonarCloud Analysis
+    needs: [frontend-lint-test, backend-lint-test]
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      
+      - name: Download frontend coverage
+        uses: actions/download-artifact@v3
+        with:
+          name: frontend-coverage
+          path: ./bhoomijal-mvp/frontend/coverage
+      
+      - name: Download backend coverage
+        uses: actions/download-artifact@v3
+        with:
+          name: backend-coverage
+          path: ./bhoomijal-mvp/backend
+      
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.projectKey=${{ github.repository_owner }}_bhoomijal-mvp
+            -Dsonar.organization=${{ github.repository_owner }}
+            -Dsonar.sources=bhoomijal-mvp/frontend/src,bhoomijal-mvp/backend/app
+            -Dsonar.tests=bhoomijal-mvp/frontend/src/__tests__,bhoomijal-mvp/backend/tests
+            -Dsonar.javascript.lcov.reportPaths=bhoomijal-mvp/frontend/coverage/lcov.info
+            -Dsonar.python.coverage.reportPaths=bhoomijal-mvp/backend/coverage.xml
+
+  deploy-dev:
+    name: Deploy to Development
+    needs: [build-scan-frontend, build-scan-backend]
+    if: github.ref == 'refs/heads/main' || github.event.inputs.environment == 'dev'
+    runs-on: ubuntu-latest
+    environment:
+      name: development
+      url: ${{ steps.deploy.outputs.deployment-url }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
+      
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name bhoomijal-dev-cluster --region ${{ secrets.AWS_REGION }}
+      
+      - name: Set image tag
+        id: set-tag
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "IMAGE_TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+          else
+            echo "IMAGE_TAG=sha-$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+          fi
+      
+      - name: Deploy to development
+        id: deploy
+        run: |
+          cd bhoomijal-mvp/k8s/dev
+          
+          # Replace placeholders in manifests
+          find . -type f -name "*.yaml" -exec sed -i "s|__FRONTEND_IMAGE__|${{ env.REGISTRY }}/${{ env.FRONTEND_IMAGE_NAME }}:${{ env.IMAGE_TAG }}|g" {} \;
+          find . -type f -name "*.yaml" -exec sed -i "s|__BACKEND_IMAGE__|${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE_NAME }}:${{ env.IMAGE_TAG }}|g" {} \;
+          
+          # Apply manifests
+          kubectl apply -f namespace.yaml
+          kubectl apply -f .
+          
+          # Wait for deployment to complete
+          kubectl rollout status deployment/bhoomijal-frontend -n bhoomijal-dev
+          kubectl rollout status deployment/bhoomijal-backend -n bhoomijal-dev
+          
+          # Get ingress URL
+          DEPLOYMENT_URL=$(kubectl get ingress bhoomijal-ingress -n bhoomijal-dev -o jsonpath="{.status.loadBalancer.ingress[0].hostname}")
+          echo "deployment-url=https://$DEPLOYMENT_URL" >> $GITHUB_OUTPUT
+      
+      - name: Run post-deployment tests
+        run: |
+          cd bhoomijal-mvp/tests
+          npm ci
+          npm run test:e2e:dev
+
+  deploy-staging:
+    name: Deploy to Staging
+    needs: [build-scan-frontend, build-scan-backend]
+    if: github.event.inputs.environment == 'staging'
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: ${{ steps.deploy.outputs.deployment-url }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
+      
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name bhoomijal-staging-cluster --region ${{ secrets.AWS_REGION }}
+      
+      - name: Set image tag
+        id: set-tag
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "IMAGE_TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+          else
+            echo "IMAGE_TAG=sha-$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+          fi
+      
+      - name: Deploy to staging
+        id: deploy
+        run: |
+          cd bhoomijal-mvp/k8s/staging
+          
+          # Replace placeholders in manifests
+          find . -type f -name "*.yaml" -exec sed -i "s|__FRONTEND_IMAGE__|${{ env.REGISTRY }}/${{ env.FRONTEND_IMAGE_NAME }}:${{ env.IMAGE_TAG }}|g" {} \;
+          find . -type f -name "*.yaml" -exec sed -i "s|__BACKEND_IMAGE__|${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE_NAME }}:${{ env.IMAGE_TAG }}|g" {} \;
+          
+          # Apply manifests
+          kubectl apply -f namespace.yaml
+          kubectl apply -f .
+          
+          # Wait for deployment to complete
+          kubectl rollout status deployment/bhoomijal-frontend -n bhoomijal-staging
+          kubectl rollout status deployment/bhoomijal-backend -n bhoomijal-staging
+          
+          # Get ingress URL
+          DEPLOYMENT_URL=$(kubectl get ingress bhoomijal-ingress -n bhoomijal-staging -o jsonpath="{.status.loadBalancer.ingress[0].hostname}")
+          echo "deployment-url=https://$DEPLOYMENT_URL" >> $GITHUB_OUTPUT
+      
+      - name: Run smoke tests
+        run: |
+          cd bhoomijal-mvp/tests
+          npm ci
+          npm run test:smoke:staging
+      
+      - name: Run performance tests
+        run: |
+          cd bhoomijal-mvp/tests
+          npm run test:performance:staging
+
+  deploy-production:
+    name: Deploy to Production
+    needs: [build-scan-frontend, build-scan-backend]
+    if: github.event.inputs.environment == 'production'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: ${{ steps.deploy.outputs.deployment-url }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
+      
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name bhoomijal-prod-cluster --region ${{ secrets.AWS_REGION }}
+      
+      - name: Set image tag
+        id: set-tag
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "IMAGE_TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+          else
+            echo "IMAGE_TAG=sha-$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+          fi
+      
+      - name: Deploy to production
+        id: deploy
+        run: |
+          cd bhoomijal-mvp/k8s/prod
+          
+          # Replace placeholders in manifests
+          find . -type f -name "*.yaml" -exec sed -i "s|__FRONTEND_IMAGE__|${{ env.REGISTRY }}/${{ env.FRONTEND_IMAGE_NAME }}:${{ env.IMAGE_TAG }}|g" {} \;
+          find . -type f -name "*.yaml" -exec sed -i "s|__BACKEND_IMAGE__|${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE_NAME }}:${{ env.IMAGE_TAG }}|g" {} \;
+          
+          # Apply manifests
+          kubectl apply -f namespace.yaml
+          kubectl apply -f .
+          
+          # Wait for deployment to complete
+          kubectl rollout status deployment/bhoomijal-frontend -n bhoomijal-prod
+          kubectl rollout status deployment/bhoomijal-backend -n bhoomijal-prod
+          
+          # Get ingress URL
+          DEPLOYMENT_URL=$(kubectl get ingress bhoomijal-ingress -n bhoomijal-prod -o jsonpath="{.status.loadBalancer.ingress[0].hostname}")
+          echo "deployment-url=https://$DEPLOYMENT_URL" >> $GITHUB_OUTPUT
+      
+      - name: Run smoke tests
+        run: |
+          cd bhoomijal-mvp/tests
+          npm ci
+          npm run test:smoke:prod
+
+  notify:
+    name: Send Notification
+    needs: [deploy-dev, deploy-staging, deploy-production]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check job status
+        id: check
+        run: |
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+            echo "status=failure" >> $GITHUB_OUTPUT
+            echo "color=danger" >> $GITHUB_OUTPUT
+            echo "icon=:x:" >> $GITHUB_OUTPUT
+          else
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "color=good" >> $GITHUB_OUTPUT
+            echo "icon=:white_check_mark:" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Determine environment
+        id: env
+        run: |
+          if [[ "${{ github.event.inputs.environment }}" != "" ]]; then
+            echo "env=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "env=dev" >> $GITHUB_OUTPUT
+          else
+            echo "env=ci" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Send Slack notification
+        uses: slackapi/slack-github-action@v1.23.0
+        with:
+          payload: |
+            {
+              "attachments": [
+                {
+                  "color": "${{ steps.check.outputs.color }}",
+                  "blocks": [
+                    {
+                      "type": "section",
+                      "text": {
+                        "type": "mrkdwn",
+                        "text": "${{ steps.check.outputs.icon }} *Bhoomijal MVP Deployment: ${{ steps.check.outputs.status }}*\n*Environment:* ${{ steps.env.outputs.env }}\n*Ref:* ${{ github.ref }}\n*Commit:* ${{ github.sha }}"
+                      }
+                    },
+                    {
+                      "type": "actions",
+                      "elements": [
+                        {
+                          "type": "button",
+                          "text": {
+                            "type": "plain_text",
+                            "text": "View Workflow"
+                          },
+                          "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK

@@ -1,0 +1,357 @@
+groups:
+  # Critical Water Level Alerts
+  - name: groundwater_critical_levels
+    rules:
+      - alert: GroundwaterCriticalLevel
+        expr: groundwater_level_mbgl > 30 or groundwater_level_percent < 15
+        for: 15m
+        labels:
+          severity: critical
+          category: water_level
+          region: '{{ $labels.state }}'
+        annotations:
+          summary: "Critical groundwater level at station {{ $labels.station_id }}"
+          description: "Station {{ $labels.station_id }} ({{ $labels.location_name }}) has reached a critical water level of {{ $value | printf \"%.2f\" }} mbgl."
+          dashboard_url: "https://bhoomijal.gov.in/stations/{{ $labels.station_id }}"
+          recommended_action: "Notify district authorities and implement water conservation measures."
+
+      - alert: GroundwaterRapidDecline
+        expr: rate(groundwater_level_mbgl[7d]) > 0.5
+        for: 1d
+        labels:
+          severity: warning
+          category: water_level
+          region: '{{ $labels.state }}'
+        annotations:
+          summary: "Rapid groundwater decline at station {{ $labels.station_id }}"
+          description: "Station {{ $labels.station_id }} ({{ $labels.location_name }}) shows rapid decline of {{ $value | printf \"%.2f\" }} meters/week."
+          dashboard_url: "https://bhoomijal.gov.in/stations/{{ $labels.station_id }}"
+          recommended_action: "Investigate local extraction activities and verify sensor readings."
+
+      - alert: GroundwaterSeasonalAnomaly
+        expr: abs(groundwater_level_mbgl - groundwater_historical_seasonal_level_mbgl) > groundwater_historical_seasonal_deviation * 2
+        for: 3d
+        labels:
+          severity: warning
+          category: water_level
+          region: '{{ $labels.state }}'
+        annotations:
+          summary: "Seasonal anomaly at station {{ $labels.station_id }}"
+          description: "Station {{ $labels.station_id }} ({{ $labels.location_name }}) shows significant deviation from seasonal expected levels."
+          dashboard_url: "https://bhoomijal.gov.in/analysis?station={{ $labels.station_id }}&mode=seasonal"
+          recommended_action: "Compare with rainfall data and check for regional patterns."
+
+      - alert: GroundwaterDistrictCritical
+        expr: sum by(district, state) (groundwater_battery_percent < 20) / count by(district, state) (groundwater_battery_percent) > 0.3
+        for: 1d
+        labels:
+          severity: critical
+          category: water_level
+          region: '{{ $labels.state }}'
+        annotations:
+          summary: "District-level critical water levels in {{ $labels.district }}"
+          description: "{{ $value | printf \"%.1f%%\" }} of stations in {{ $labels.district }}, {{ $labels.state }} are reporting critical water levels."
+          dashboard_url: "https://bhoomijal.gov.in/map?filter=critical&district={{ $labels.district }}"
+          recommended_action: "Escalate to state water resources department and prepare district action plan."
+
+  # Station Connectivity Monitoring
+  - name: station_connectivity
+    rules:
+      - alert: StationDataStale
+        expr: (time() - groundwater_last_reading_timestamp) / 3600 > 24
+        for: 1h
+        labels:
+          severity: warning
+          category: connectivity
+          region: '{{ $labels.state }}'
+        annotations:
+          summary: "Stale data from station {{ $labels.station_id }}"
+          description: "Station {{ $labels.station_id }} ({{ $labels.location_name }}) has not reported new data for {{ $value | printf \"%.1f\" }} hours."
+          dashboard_url: "https://bhoomijal.gov.in/stations/{{ $labels.station_id }}?tab=status"
+          recommended_action: "Check station connectivity and power supply status."
+
+      - alert: StationCommunicationFailure
+        expr: (time() - groundwater_last_reading_timestamp) / 3600 > 72
+        for: 6h
+        labels:
+          severity: critical
+          category: connectivity
+          region: '{{ $labels.state }}'
+        annotations:
+          summary: "Communication failure with station {{ $labels.station_id }}"
+          description: "Station {{ $labels.station_id }} ({{ $labels.location_name }}) has been offline for {{ $value | printf \"%.1f\" }} hours."
+          dashboard_url: "https://bhoomijal.gov.in/stations/{{ $labels.station_id }}?tab=status"
+          recommended_action: "Dispatch field team for on-site inspection and repair."
+
+      - alert: StationLowBattery
+        expr: groundwater_station_battery_percent < 20
+        for: 6h
+        labels:
+          severity: warning
+          category: connectivity
+          region: '{{ $labels.state }}'
+        annotations:
+          summary: "Low battery at station {{ $labels.station_id }}"
+          description: "Station {{ $labels.station_id }} ({{ $labels.location_name }}) battery at {{ $value | printf \"%.1f%%\" }}."
+          dashboard_url: "https://bhoomijal.gov.in/stations/{{ $labels.station_id }}?tab=status"
+          recommended_action: "Schedule battery replacement or solar panel maintenance."
+
+      - alert: MultipleStationsOffline
+        expr: count by(district) (groundwater_station_status == 0) / count by(district) (groundwater_station_status) > 0.2
+        for: 12h
+        labels:
+          severity: critical
+          category: connectivity
+          region: '{{ $labels.state }}'
+        annotations:
+          summary: "Multiple stations offline in {{ $labels.district }}"
+          description: "{{ $value | printf \"%.1f%%\" }} of stations in {{ $labels.district }} district are currently offline."
+          dashboard_url: "https://bhoomijal.gov.in/map?filter=offline&district={{ $labels.district }}"
+          recommended_action: "Check for regional power outages or network connectivity issues."
+
+  # Data Quality Alerts
+  - name: data_quality
+    rules:
+      - alert: GroundwaterDataOutlier
+        expr: abs((groundwater_level_mbgl - avg_over_time(groundwater_level_mbgl[30d])) / stddev_over_time(groundwater_level_mbgl[30d])) > 3
+        for: 6h
+        labels:
+          severity: warning
+          category: data_quality
+          region: '{{ $labels.state }}'
+        annotations:
+          summary: "Outlier data detected at station {{ $labels.station_id }}"
+          description: "Station {{ $labels.station_id }} ({{ $labels.location_name }}) reporting values {{ $value | printf \"%.1f\" }} standard deviations from 30-day mean."
+          dashboard_url: "https://bhoomijal.gov.in/stations/{{ $labels.station_id }}?tab=quality"
+          recommended_action: "Verify sensor calibration and check for physical anomalies."
+
+      - alert: GroundwaterDataGaps
+        expr: count_over_time(groundwater_level_mbgl[24h:1h]) < 20
+        for: 1h
+        labels:
+          severity: warning
+          category: data_quality
+          region: '{{ $labels.state }}'
+        annotations:
+          summary: "Data gaps detected at station {{ $labels.station_id }}"
+          description: "Station {{ $labels.station_id }} ({{ $labels.location_name }}) has {{ $value }} readings in the last 24h (expected 24)."
+          dashboard_url: "https://bhoomijal.gov.in/stations/{{ $labels.station_id }}?tab=quality"
+          recommended_action: "Check transmission frequency settings and network connectivity."
+
+      - alert: SensorCalibrationDrift
+        expr: abs(groundwater_level_mbgl - groundwater_manual_measurement_mbgl) > 0.5
+        for: 7d
+        labels:
+          severity: warning
+          category: data_quality
+          region: '{{ $labels.state }}'
+        annotations:
+          summary: "Sensor calibration drift at station {{ $labels.station_id }}"
+          description: "Station {{ $labels.station_id }} ({{ $labels.location_name }}) automatic readings differ from manual measurements by {{ $value | printf \"%.2f\" }} meters."
+          dashboard_url: "https://bhoomijal.gov.in/stations/{{ $labels.station_id }}?tab=calibration"
+          recommended_action: "Schedule sensor recalibration by field team."
+
+      - alert: RainfallDataMissing
+        expr: (time() - rainfall_last_reading_timestamp) / 86400 > 7 and on(station_id) groundwater_level_mbgl
+        for: 1d
+        labels:
+          severity: warning
+          category: data_quality
+          region: '{{ $labels.state }}'
+        annotations:
+          summary: "Missing rainfall data for station {{ $labels.station_id }}"
+          description: "Station {{ $labels.station_id }} ({{ $labels.location_name }}) has groundwater data but missing rainfall data for {{ $value | printf \"%.1f\" }} days."
+          dashboard_url: "https://bhoomijal.gov.in/stations/{{ $labels.station_id }}?tab=rainfall"
+          recommended_action: "Check rainfall sensor or data integration with meteorological department."
+
+  # Regional Trend Alerts
+  - name: regional_trends
+    rules:
+      - alert: DistrictWideDecliningTrend
+        expr: sum by(district, state) (rate(groundwater_level_mbgl[30d]) > 0.2) / count by(district, state) (groundwater_level_mbgl) > 0.5
+        for: 7d
+        labels:
+          severity: warning
+          category: regional_trend
+          region: '{{ $labels.state }}'
+        annotations:
+          summary: "District-wide declining trend in {{ $labels.district }}"
+          description: "{{ $value | printf \"%.1f%%\" }} of stations in {{ $labels.district }}, {{ $labels.state }} show declining trends over the past month."
+          dashboard_url: "https://bhoomijal.gov.in/analysis?district={{ $labels.district }}&mode=trend"
+          recommended_action: "Analyze extraction patterns and prepare water conservation advisory."
+
+      - alert: StateWideCriticalStatus
+        expr: sum by(state) (groundwater_battery_percent < 25) / count by(state) (groundwater_battery_percent) > 0.3
+        for: 7d
+        labels:
+          severity: critical
+          category: regional_trend
+          region: '{{ $labels.state }}'
+        annotations:
+          summary: "State-wide critical water status in {{ $labels.state }}"
+          description: "{{ $value | printf \"%.1f%%\" }} of stations in {{ $labels.state }} are reporting critical water levels."
+          dashboard_url: "https://bhoomijal.gov.in/analysis?state={{ $labels.state }}&mode=overview"
+          recommended_action: "Escalate to state water resources minister and central water commission."
+
+      - alert: AquiferDepletion
+        expr: sum by(aquifer_name) (groundwater_depletion_rate_yearly > 0.5) / count by(aquifer_name) (groundwater_depletion_rate_yearly) > 0.6
+        for: 30d
+        labels:
+          severity: critical
+          category: regional_trend
+        annotations:
+          summary: "Aquifer depletion alert for {{ $labels.aquifer_name }}"
+          description: "{{ $value | printf \"%.1f%%\" }} of stations in {{ $labels.aquifer_name }} aquifer show significant yearly depletion rates."
+          dashboard_url: "https://bhoomijal.gov.in/analysis?aquifer={{ $labels.aquifer_name }}&mode=depletion"
+          recommended_action: "Implement aquifer management plan and extraction restrictions."
+
+      - alert: PostMonsoonRecoveryFailure
+        expr: (groundwater_post_monsoon_level_mbgl - groundwater_pre_monsoon_level_mbgl) / groundwater_expected_monsoon_recovery < 0.7
+        for: 30d
+        labels:
+          severity: warning
+          category: regional_trend
+          region: '{{ $labels.state }}'
+        annotations:
+          summary: "Poor monsoon recovery at {{ $labels.station_id }}"
+          description: "Station {{ $labels.station_id }} ({{ $labels.location_name }}) shows only {{ $value | printf \"%.1f%%\" }} of expected post-monsoon recovery."
+          dashboard_url: "https://bhoomijal.gov.in/stations/{{ $labels.station_id }}?tab=seasonal"
+          recommended_action: "Analyze rainfall patterns and local recharge conditions."
+
+  # Performance Thresholds
+  - name: performance_thresholds
+    rules:
+      - alert: APIHighLatency
+        expr: histogram_quantile(0.95, sum(rate(api_request_duration_seconds_bucket{handler=~"/api/v1/stations.*"}[5m])) by (le, handler)) > 1
+        for: 10m
+        labels:
+          severity: warning
+          category: performance
+        annotations:
+          summary: "High API latency for {{ $labels.handler }}"
+          description: "95th percentile latency for {{ $labels.handler }} is {{ $value | printf \"%.2f\" }} seconds."
+          dashboard_url: "https://bhoomijal.gov.in/admin/monitoring/api-performance"
+          recommended_action: "Check database query performance and API endpoint optimization."
+
+      - alert: DataProcessingDelay
+        expr: groundwater_data_processing_lag_seconds > 300
+        for: 15m
+        labels:
+          severity: warning
+          category: performance
+        annotations:
+          summary: "Data processing delay detected"
+          description: "Telemetry data processing lag is {{ $value | printf \"%.1f\" }} seconds (threshold: 300s)."
+          dashboard_url: "https://bhoomijal.gov.in/admin/monitoring/data-pipeline"
+          recommended_action: "Check data processing pipeline and worker node capacity."
+
+      - alert: HighDatabaseLoad
+        expr: rate(postgresql_stat_database_xact_commit{datname="bhoomijal_db"}[1m]) > 1000
+        for: 5m
+        labels:
+          severity: warning
+          category: performance
+        annotations:
+          summary: "High database transaction rate"
+          description: "Database is processing {{ $value | printf \"%.0f\" }} transactions per second."
+          dashboard_url: "https://bhoomijal.gov.in/admin/monitoring/database"
+          recommended_action: "Review query patterns and consider scaling database resources."
+
+      - alert: SlowMapRendering
+        expr: histogram_quantile(0.95, sum(rate(frontend_map_render_duration_seconds_bucket[5m])) by (le)) > 3
+        for: 15m
+        labels:
+          severity: warning
+          category: performance
+        annotations:
+          summary: "Slow map rendering detected"
+          description: "95th percentile map rendering time is {{ $value | printf \"%.2f\" }} seconds."
+          dashboard_url: "https://bhoomijal.gov.in/admin/monitoring/frontend-performance"
+          recommended_action: "Optimize clustering algorithm and reduce marker count."
+
+  # Business Continuity Alerts
+  - name: business_continuity
+    rules:
+      - alert: SystemHealthCritical
+        expr: system_health_score < 0.7
+        for: 15m
+        labels:
+          severity: critical
+          category: system_health
+        annotations:
+          summary: "System health critical"
+          description: "Overall system health score is {{ $value | printf \"%.2f\" }} (threshold: 0.7)."
+          dashboard_url: "https://bhoomijal.gov.in/admin/monitoring/system-health"
+          recommended_action: "Initiate incident response protocol and check system components."
+
+      - alert: BackupFailure
+        expr: time() - backup_last_success_timestamp > 86400
+        for: 1h
+        labels:
+          severity: critical
+          category: backup
+        annotations:
+          summary: "Database backup failure"
+          description: "Last successful backup was {{ $value | printf \"%.1f\" }} hours ago."
+          dashboard_url: "https://bhoomijal.gov.in/admin/monitoring/backups"
+          recommended_action: "Check backup system logs and storage capacity."
+
+      - alert: HighErrorRate
+        expr: sum(rate(http_requests_total{status=~"5.."}[5m])) / sum(rate(http_requests_total[5m])) > 0.05
+        for: 10m
+        labels:
+          severity: critical
+          category: system_health
+        annotations:
+          summary: "High error rate detected"
+          description: "Error rate is {{ $value | printf \"%.2f%%\" }} (threshold: 5%)."
+          dashboard_url: "https://bhoomijal.gov.in/admin/monitoring/errors"
+          recommended_action: "Check application logs and recent deployments."
+
+      - alert: LowDiskSpace
+        expr: (node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) * 100 < 15
+        for: 10m
+        labels:
+          severity: warning
+          category: system_health
+        annotations:
+          summary: "Low disk space on {{ $labels.instance }}"
+          description: "{{ $value | printf \"%.1f%%\" }} disk space remaining on {{ $labels.instance }}."
+          dashboard_url: "https://bhoomijal.gov.in/admin/monitoring/disk-usage"
+          recommended_action: "Clean up temporary files or expand storage."
+
+      - alert: HighMemoryUsage
+        expr: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 90
+        for: 15m
+        labels:
+          severity: critical
+          category: system_health
+        annotations:
+          summary: "High memory usage on {{ $labels.instance }}"
+          description: "Memory usage at {{ $value | printf \"%.1f%%\" }} on {{ $labels.instance }}."
+          dashboard_url: "https://bhoomijal.gov.in/admin/monitoring/memory-usage"
+          recommended_action: "Check for memory leaks or scale up resources."
+
+      - alert: ServiceUnavailable
+        expr: up == 0
+        for: 5m
+        labels:
+          severity: critical
+          category: system_health
+        annotations:
+          summary: "Service {{ $labels.job }} is down"
+          description: "Service {{ $labels.job }} on {{ $labels.instance }} has been down for 5+ minutes."
+          dashboard_url: "https://bhoomijal.gov.in/admin/monitoring/services"
+          recommended_action: "Restart service and check dependency health."
+
+      - alert: ReplicationLag
+        expr: pg_replication_lag > 300
+        for: 5m
+        labels:
+          severity: warning
+          category: system_health
+        annotations:
+          summary: "Database replication lag"
+          description: "Replication lag is {{ $value | printf \"%.1f\" }} seconds."
+          dashboard_url: "https://bhoomijal.gov.in/admin/monitoring/database-replication"
+          recommended_action: "Check network between primary and replica, and replica server load."

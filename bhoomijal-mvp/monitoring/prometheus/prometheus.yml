@@ -1,0 +1,233 @@
+# Bhoomijal MVP - Prometheus Configuration
+# This file configures Prometheus for monitoring the Bhoomijal groundwater monitoring system
+
+global:
+  scrape_interval: 15s     # Set the scrape interval to every 15 seconds (default)
+  evaluation_interval: 15s # Evaluate rules every 15 seconds
+  scrape_timeout: 10s      # Timeout for scrape requests
+  
+  # Labels assigned to all time series and alerts
+  external_labels:
+    monitor: 'bhoomijal-monitoring'
+    environment: '${ENVIRONMENT:-production}'
+    region: '${REGION:-in-north}'
+
+# Alertmanager configuration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          - alertmanager:9093
+      scheme: http
+      timeout: 10s
+      api_version: v2
+
+# Rule files to load
+rule_files:
+  - "rules/recording_rules.yml"   # Aggregation and recording rules
+  - "rules/alerting_rules.yml"    # Alert definitions
+  - "rules/groundwater_rules.yml" # Domain-specific groundwater monitoring rules
+
+# Scrape configurations
+scrape_configs:
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+        labels:
+          service: 'prometheus'
+          component: 'monitoring'
+
+  # Backend API monitoring
+  - job_name: 'backend'
+    metrics_path: '/api/v1/metrics'
+    scheme: http
+    scrape_interval: 10s
+    scrape_timeout: 5s
+    static_configs:
+      - targets: ['backend:8000']
+        labels:
+          service: 'bhoomijal-backend'
+          component: 'api'
+    
+    # Basic auth if metrics endpoint is protected
+    basic_auth:
+      username: ${PROMETHEUS_METRICS_USER:-metrics}
+      password: ${PROMETHEUS_METRICS_PASSWORD:-metrics_password}
+    
+    # Relabeling to add custom labels from metadata
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        regex: backend
+        action: keep
+      - source_labels: [__meta_kubernetes_pod_label_version]
+        target_label: version
+        action: replace
+
+  # Frontend monitoring (if instrumented)
+  - job_name: 'frontend'
+    metrics_path: '/metrics'
+    scheme: http
+    static_configs:
+      - targets: ['frontend:8080']
+        labels:
+          service: 'bhoomijal-frontend'
+          component: 'ui'
+
+  # Node exporter for host metrics
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['node-exporter:9100']
+        labels:
+          service: 'node-metrics'
+          component: 'infrastructure'
+
+  # PostgreSQL metrics via postgres-exporter
+  - job_name: 'postgres'
+    static_configs:
+      - targets: ['postgres-exporter:9187']
+        labels:
+          service: 'postgres'
+          component: 'database'
+    
+    # Metric relabeling to clean up and standardize metrics
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: 'pg_.*'
+        action: keep
+
+  # Redis metrics
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis-exporter:9121']
+        labels:
+          service: 'redis'
+          component: 'cache'
+
+  # Custom groundwater telemetry metrics
+  - job_name: 'groundwater-telemetry'
+    metrics_path: '/api/v1/telemetry/metrics'
+    scrape_interval: 60s  # Longer interval for telemetry data
+    scheme: http
+    static_configs:
+      - targets: ['backend:8000']
+        labels:
+          service: 'bhoomijal-telemetry'
+          component: 'groundwater-data'
+    
+    # Metric relabeling for groundwater-specific metrics
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: 'groundwater_.*'
+        action: keep
+      - source_labels: [station_id]
+        target_label: station
+        action: replace
+      - source_labels: [district]
+        target_label: district
+        action: replace
+      - source_labels: [state]
+        target_label: state
+        action: replace
+
+  # Kubernetes service discovery (when deployed to k8s)
+  - job_name: 'kubernetes-pods'
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names:
+            - bhoomijal-prod
+            - bhoomijal-monitoring
+    
+    # Only keep pods with prometheus.io/scrape=true annotation
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: true
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        action: replace
+        target_label: __metrics_path__
+        regex: (.+)
+      - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+        action: replace
+        regex: ([^:]+)(?::\d+)?;(\d+)
+        replacement: $1:$2
+        target_label: __address__
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        action: replace
+        target_label: app
+      - source_labels: [__meta_kubernetes_namespace]
+        action: replace
+        target_label: kubernetes_namespace
+      - source_labels: [__meta_kubernetes_pod_name]
+        action: replace
+        target_label: kubernetes_pod_name
+
+  # File-based service discovery for dynamic environments
+  - job_name: 'file-sd-targets'
+    file_sd_configs:
+      - files:
+          - '/etc/prometheus/file_sd/*.json'
+        refresh_interval: 5m
+    
+    # Process discovered targets
+    relabel_configs:
+      - source_labels: [service]
+        target_label: service
+        action: replace
+      - source_labels: [component]
+        target_label: component
+        action: replace
+
+  # Blackbox probing for endpoint health checks
+  - job_name: 'blackbox'
+    metrics_path: /probe
+    params:
+      module: [http_2xx]  # Use the http_2xx module
+    static_configs:
+      - targets:
+          - https://bhoomijal.gov.in/api/v1/health
+          - https://bhoomijal.gov.in/health.txt
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox-exporter:9115  # Blackbox exporter's address
+
+# Storage configuration
+storage:
+  tsdb:
+    path: /prometheus
+    retention:
+      time: 15d
+      size: 10GB
+    # Enable exemplars for more detailed tracing integration
+    exemplars:
+      storage:
+        max_exemplars: 100000
+
+# Remote write configuration (optional)
+remote_write:
+  - url: "${REMOTE_WRITE_URL:-}"
+    remote_timeout: 30s
+    queue_config:
+      capacity: 10000
+      max_samples_per_send: 1000
+      batch_send_deadline: 5s
+    write_relabel_configs:
+      - source_labels: [__name__]
+        regex: 'go_.*'
+        action: drop  # Drop Go runtime metrics to reduce volume
+
+# Remote read configuration (optional)
+remote_read:
+  - url: "${REMOTE_READ_URL:-}"
+    read_recent: true
+
+# TRACING INTEGRATION
+tracing:
+  endpoint: "${JAEGER_ENDPOINT:-jaeger:14268/api/traces}"
+  sampling_fraction: 0.1
+  insecure: true
